@@ -1,6 +1,9 @@
 use std::collections::HashMap;
-use std::env;
-use std::io::{self, ErrorKind, Read};
+use std::fs::File;
+use std::{env, process};
+use std::io::{self, BufWriter, ErrorKind, Read, Write};
+
+const NEWLINE: u8 = b'\n';
 
 static OPCODES: [&str; 14] = [
     "cmove", "aidx", "amend", "add", "mul", "div", "nand", "halt", "alloc", "aban", "out", "in",
@@ -39,10 +42,12 @@ struct UM32 {
     rb: usize,
     rc: usize,
     debug: bool,
+    ibuf: String,
+    debug_file: Option<File>,
 }
 
 impl UM32 {
-    fn new(debug: bool) -> UM32 {
+    fn new(debug: bool, debug_file: Option<File>) -> UM32 {
         // Eight distinct general-purpose registers, capable of holding one
         // platter each.
         // All registers shall be initialized with platters of value '0'.
@@ -63,10 +68,19 @@ impl UM32 {
             rb: 0,
             rc: 0,
             debug: debug,
+            ibuf: String::new(),
+            debug_file: debug_file,
         }
     }
 
     fn parse<R: Read>(&mut self, mut reader: R) {
+        if self.debug {
+            write!(self.debug_file.as_mut().unwrap(),
+                "{:>8}: {:<8} {:>8} {:<8} {:<8} {:<8}",
+                "ip", "ins", "op", "ra", "rb", "rc"
+            ).unwrap();
+        }
+
         // The machine shall be initialized with a '0' array whose contents
         // shall be read from a "program" scroll.  The execution finger shall
         // point to the first platter of the '0' array, which has offset zero.
@@ -85,13 +99,6 @@ impl UM32 {
     }
 
     fn run(&mut self) {
-        if self.debug {
-            println!(
-                "{:>8}: {:<8} {:>8} {:<8} {:<8} {:<8}",
-                "ip", "ins", "op", "ra", "rb", "rc"
-            );
-        }
-
         loop {
             let ip = self.finger;
             let ins = self.heap[&0][self.finger as usize];
@@ -133,7 +140,7 @@ impl UM32 {
         self.read_registers(instruction);
 
         if self.debug {
-            println!(
+            write!(self.debug_file.as_mut().unwrap(),
                 "{:08X}: {:08X} {:>8} {:08X} {:08X} {:08X}",
                 ip,
                 instruction,
@@ -141,7 +148,7 @@ impl UM32 {
                 self.registers[self.ra],
                 self.registers[self.rb],
                 self.registers[self.rc],
-            );
+            ).unwrap();
         }
 
         match opcode {
@@ -156,7 +163,7 @@ impl UM32 {
             8 => self.alloc(),
             9 => self.aban(),
             10 => self.out(),
-            11 => return Err("unimplemented operation 'in'".to_string()),
+            11 => self.input(),
             12 => self.load(),
             13 => self.ortho(instruction),
             _ => {
@@ -272,9 +279,31 @@ impl UM32 {
     // #10. Output.
     // The value in the register C is displayed on the console
     // immediately. Only values between and including 0 and 255
-    // are allowed.
+    // are allowed. 
     fn out(&self) {
-        print!("{}", char::from_u32(self.registers[self.rc]).unwrap());
+        io::stdout().write(&[self.registers[self.rc] as u8]).unwrap();
+    }
+
+    // #11. Input.
+    // The universal machine waits for input on the console.
+    // When input arrives, the register C is loaded with the
+    // input, which must be between and including 0 and 255.
+    // If the end of input has been signaled, then the 
+    // register C is endowed with a uniform value pattern
+    // where every place is pregnant with the 1 bit.
+    fn input(&mut self) {
+        // We create an input buffer so we don't have to deal with terminal raw mode, etc.
+        if self.ibuf.is_empty() {
+            io::stdin().read_line(&mut self.ibuf).unwrap();
+        }
+
+        let c = self.ibuf.remove(0);
+        if c as u8 == NEWLINE {
+            self.registers[self.rc] = 0xFFFFFFFF;
+            return;
+        }
+
+        self.registers[self.rc] = c as u32;
     }
 
     // #12. Load Program.
@@ -333,8 +362,23 @@ impl UM32 {
 }
 
 fn main() {
+    let args: Vec<String> = env::args().collect();
+    if args.len() != 2 {
+        eprintln!("Provide a UM-32 program as an argument.");
+        process::exit(-1);
+    }
+
+    let program = File::open(args[1].as_str()).unwrap();
     let debug = env::var("DEBUG").is_ok();
-    let mut um = UM32::new(debug);
-    um.parse(io::stdin());
+
+    let mut debug_file: Option<File> = None;
+    if debug {
+        debug_file = Some(File::create(env::var("DEBUG_FILE").unwrap()).unwrap());
+    }
+
+    let mut um = UM32::new(debug, debug_file);
+    um.parse(program);
+    
+
     um.run();
 }
