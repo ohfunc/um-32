@@ -1,9 +1,13 @@
-use std::collections::HashMap;
 use std::fs::File;
+use std::io::{self, ErrorKind, Read, Write};
 use std::{env, process};
-use std::io::{self, BufWriter, ErrorKind, Read, Write};
 
 const NEWLINE: u8 = b'\n';
+const RA_OFF: usize = 6;
+const RB_OFF: usize = 3;
+const REG_MASK: u32 = 0b111u32;
+const ORTHO_MASK: u32 = 0b1111111111111111111111111u32;
+const EOI: u32 = 0xFFFFFFFF;
 
 static OPCODES: [&str; 14] = [
     "cmove", "aidx", "amend", "add", "mul", "div", "nand", "halt", "alloc", "aban", "out", "in",
@@ -35,7 +39,7 @@ type Register = u32;
 struct UM32 {
     registers: [Register; 8],
     free: Vec<Addr>,
-    heap: HashMap<Addr, Vec<Platter>>,
+    heap: Vec<Option<Vec<Platter>>>,
     finger: Addr,
     // Indices to the given registers for a given instruction.
     ra: usize,
@@ -57,7 +61,7 @@ impl UM32 {
         // 32-bit identifier. One distinguished array is referenced by 0
         // and stores the "program." This array will be referred to as the
         // '0' array.
-        let heap: HashMap<Addr, Vec<Platter>> = HashMap::new();
+        let heap: Vec<Option<Vec<Platter>>> = vec![None];
 
         UM32 {
             registers,
@@ -75,10 +79,17 @@ impl UM32 {
 
     fn parse<R: Read>(&mut self, mut reader: R) {
         if self.debug {
-            write!(self.debug_file.as_mut().unwrap(),
+            write!(
+                self.debug_file.as_mut().unwrap(),
                 "{:>8}: {:<8} {:>8} {:<8} {:<8} {:<8}",
-                "ip", "ins", "op", "ra", "rb", "rc"
-            ).unwrap();
+                "ip",
+                "ins",
+                "op",
+                "ra",
+                "rb",
+                "rc"
+            )
+            .unwrap();
         }
 
         // The machine shall be initialized with a '0' array whose contents
@@ -95,13 +106,13 @@ impl UM32 {
                 },
             }
         }
-        self.heap.insert(0, program);
+        self.heap[0] = Some(program);
     }
 
     fn run(&mut self) {
         loop {
             let ip = self.finger;
-            let ins = self.heap[&0][self.finger as usize];
+            let ins = self.heap[0].as_mut().unwrap()[self.finger as usize];
             match self.spin(ip, ins) {
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -130,9 +141,9 @@ impl UM32 {
     //  |                         |
     //  operator number           B
     fn read_registers(&mut self, platter: Platter) {
-        self.ra = (platter >> 6 & 0b111u32) as usize;
-        self.rb = (platter >> 3 & 0b111u32) as usize;
-        self.rc = (platter & 0b111u32) as usize;
+        self.ra = (platter >> RA_OFF & REG_MASK) as usize;
+        self.rb = (platter >> RB_OFF & REG_MASK) as usize;
+        self.rc = (platter & REG_MASK) as usize;
     }
 
     fn spin(&mut self, ip: Addr, instruction: Platter) -> Result<(), String> {
@@ -140,7 +151,8 @@ impl UM32 {
         self.read_registers(instruction);
 
         if self.debug {
-            write!(self.debug_file.as_mut().unwrap(),
+            write!(
+                self.debug_file.as_mut().unwrap(),
                 "{:08X}: {:08X} {:>8} {:08X} {:08X} {:08X}",
                 ip,
                 instruction,
@@ -148,7 +160,8 @@ impl UM32 {
                 self.registers[self.ra],
                 self.registers[self.rb],
                 self.registers[self.rc],
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         match opcode {
@@ -190,17 +203,18 @@ impl UM32 {
     // The register A receives the value stored at offset
     // in register C in the array identified by B.
     fn aidx(&mut self) {
-        self.registers[self.ra] =
-            self.heap.get(&self.registers[self.rb]).unwrap()[self.registers[self.rc] as usize];
+        self.registers[self.ra] = self.heap[self.registers[self.rb] as usize]
+            .as_mut()
+            .unwrap()[self.registers[self.rc] as usize];
     }
 
     // #2. Array Amendment.
     // The array identified by A is amended at the offset
     // in register B to store the value in register C.
     fn amend(&mut self) {
-        self.heap
-            .entry(self.registers[self.ra])
-            .and_modify(|f| f[self.registers[self.rb] as usize] = self.registers[self.rc]);
+        self.heap[self.registers[self.ra] as usize]
+            .as_mut()
+            .unwrap()[self.registers[self.rb] as usize] = self.registers[self.rc];
     }
 
     // #3. Addition.
@@ -251,22 +265,15 @@ impl UM32 {
         // Fast path: allocate from our list of free "pages".
         match self.free.pop() {
             Some(a) => {
-                self.heap.insert(a, vec![0; s]);
+                self.heap[a as usize] = Some(vec![0; s]);
                 self.registers[self.rb] = a;
                 return;
             }
             None => (),
         }
 
-        // Allocate random addresses until one is empty.
-        loop {
-            let a = rand::random::<u32>();
-            if a != 0 && !self.heap.contains_key(&a) {
-                self.heap.insert(a, vec![0; s]);
-                self.registers[self.rb] = a;
-                break;
-            }
-        }
+        self.heap.push(Some(vec![0; s]));
+        self.registers[self.rb] = (self.heap.len() - 1) as u32;
     }
 
     // #9. Abandonment.
@@ -279,16 +286,18 @@ impl UM32 {
     // #10. Output.
     // The value in the register C is displayed on the console
     // immediately. Only values between and including 0 and 255
-    // are allowed. 
+    // are allowed.
     fn out(&self) {
-        io::stdout().write(&[self.registers[self.rc] as u8]).unwrap();
+        io::stdout()
+            .write(&[self.registers[self.rc] as u8])
+            .unwrap();
     }
 
     // #11. Input.
     // The universal machine waits for input on the console.
     // When input arrives, the register C is loaded with the
     // input, which must be between and including 0 and 255.
-    // If the end of input has been signaled, then the 
+    // If the end of input has been signaled, then the
     // register C is endowed with a uniform value pattern
     // where every place is pregnant with the 1 bit.
     fn input(&mut self) {
@@ -299,7 +308,7 @@ impl UM32 {
 
         let c = self.ibuf.remove(0);
         if c as u8 == NEWLINE {
-            self.registers[self.rc] = 0xFFFFFFFF;
+            self.registers[self.rc] = EOI;
             return;
         }
 
@@ -326,8 +335,8 @@ impl UM32 {
             return;
         }
 
-        let v = self.heap.get(&self.registers[self.rb]).cloned().unwrap();
-        self.heap.insert(0, v);
+        let v = self.heap[self.registers[self.rb] as usize].clone().unwrap();
+        self.heap[0] = Some(v);
     }
 
     // One special operator does not describe registers in the same way.
@@ -355,8 +364,8 @@ impl UM32 {
     // The value indicated is loaded into the register A
     // forthwith.
     fn ortho(&mut self, instruction: Platter) {
-        self.ra = (instruction >> 25 & 0b111u32) as usize;
-        let value = instruction & 0b1111111111111111111111111u32;
+        self.ra = (instruction >> 25 & REG_MASK) as usize;
+        let value = instruction & ORTHO_MASK;
         self.registers[self.ra] = value;
     }
 }
@@ -378,7 +387,6 @@ fn main() {
 
     let mut um = UM32::new(debug, debug_file);
     um.parse(program);
-    
 
     um.run();
 }
