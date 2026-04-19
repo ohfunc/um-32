@@ -1,17 +1,13 @@
 use std::fs::File;
-use std::io::{self, ErrorKind, Read, Write};
-use std::{env, process};
+use std::io::{self, BufWriter, ErrorKind, Read, Write};
+use std::{env};
 
 const NEWLINE: u8 = b'\n';
-const RA_OFF: usize = 6;
-const RB_OFF: usize = 3;
-const REG_MASK: u32 = 0b111u32;
-const ORTHO_MASK: u32 = 0b1111111111111111111111111u32;
 const EOI: u32 = 0xFFFFFFFF;
 
-static OPCODES: [&str; 14] = [
-    "cmove", "aidx", "amend", "add", "mul", "div", "nand", "halt", "alloc", "aban", "out", "in",
-    "load", "orth",
+const OPCODES: [&str; 14] = [
+    "CMOVE", "AIDX", "AMEND", "ADD", "MUL", "DIV", "NAND", "HALT", "ALLOC", "ABAN", "OUT", "IN",
+    "LOAD", "ORTH",
 ];
 
 // An infinite supply of sandstone platters, with room on each
@@ -27,8 +23,6 @@ static OPCODES: [&str; 14] = [
 //         |
 //         most meaningful bit
 //
-//         Figure 0. Platters
-
 // Each bit may be the 0 bit or the 1 bit. Using the system of
 // "unsigned 32-bit numbers" (see patent #4,294,967,295) the
 // markings on these platters may also denote numbers.
@@ -37,61 +31,43 @@ type Addr = u32;
 type Register = u32;
 
 struct UM32 {
+    // Eight distinct general-purpose registers, capable of holding one
+    // platter each.
+    // All registers shall be initialized with platters of value '0'.
     registers: [Register; 8],
     free: Vec<Addr>,
+    // A collection of arrays of platters, each referenced by a distinct
+    // 32-bit identifier. One distinguished array is referenced by 0
+    // and stores the "program." This array will be referred to as the
+    // '0' array.
     heap: Vec<Option<Vec<Platter>>>,
     finger: Addr,
-    // Indices to the given registers for a given instruction.
+    // Indices to the given registers for the current instruction.
     ra: usize,
     rb: usize,
     rc: usize,
-    debug: bool,
+    decomp: bool,
     ibuf: String,
-    debug_file: Option<File>,
+    decomp_file: Option<BufWriter<File>>,
 }
 
 impl UM32 {
-    fn new(debug: bool, debug_file: Option<File>) -> UM32 {
-        // Eight distinct general-purpose registers, capable of holding one
-        // platter each.
-        // All registers shall be initialized with platters of value '0'.
-        let registers: [u32; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
-
-        // A collection of arrays of platters, each referenced by a distinct
-        // 32-bit identifier. One distinguished array is referenced by 0
-        // and stores the "program." This array will be referred to as the
-        // '0' array.
-        let heap: Vec<Option<Vec<Platter>>> = vec![None];
-
+    fn new(debug: bool, debug_file: Option<BufWriter<File>>) -> UM32 {
         UM32 {
-            registers,
-            heap: heap,
+            registers: [0; 8],
+            heap: vec![None],
             free: Vec::new(),
             finger: 0,
             ra: 0,
             rb: 0,
             rc: 0,
-            debug: debug,
+            decomp: debug,
             ibuf: String::new(),
-            debug_file: debug_file,
+            decomp_file: debug_file,
         }
     }
 
     fn parse<R: Read>(&mut self, mut reader: R) {
-        if self.debug {
-            write!(
-                self.debug_file.as_mut().unwrap(),
-                "{:>8}: {:<8} {:>8} {:<8} {:<8} {:<8}",
-                "ip",
-                "ins",
-                "op",
-                "ra",
-                "rb",
-                "rc"
-            )
-            .unwrap();
-        }
-
         // The machine shall be initialized with a '0' array whose contents
         // shall be read from a "program" scroll.  The execution finger shall
         // point to the first platter of the '0' array, which has offset zero.
@@ -109,17 +85,16 @@ impl UM32 {
         self.heap[0] = Some(program);
     }
 
-    fn run(&mut self) {
+    fn run(&mut self) -> Result<(), String> {
         loop {
-            let ip = self.finger;
-            let ins = self.heap[0].as_mut().unwrap()[self.finger as usize];
-            match self.spin(ip, ins) {
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    break;
-                }
-                _ => (),
+            let program = self.heap[0].as_mut().unwrap();
+            if self.finger as usize >= program.len() {
+                return Err("end of program reached before HALT instruction".to_string());
             }
+
+            let ip = self.finger;
+            let ins = program[self.finger as usize];
+            self.spin(ip, ins)?;
 
             // Determine whether we've just performed an ortho operation.
             // If so, don't advance the finger.
@@ -141,27 +116,35 @@ impl UM32 {
     //  |                         |
     //  operator number           B
     fn read_registers(&mut self, platter: Platter) {
-        self.ra = (platter >> RA_OFF & REG_MASK) as usize;
-        self.rb = (platter >> RB_OFF & REG_MASK) as usize;
-        self.rc = (platter & REG_MASK) as usize;
+        self.ra = (platter >> 6 & 0b111u32) as usize;
+        self.rb = (platter >> 3 & 0b111u32) as usize;
+        self.rc = (platter & 0b111u32) as usize;
     }
 
     fn spin(&mut self, ip: Addr, instruction: Platter) -> Result<(), String> {
         let opcode = instruction >> 28;
         self.read_registers(instruction);
 
-        if self.debug {
-            write!(
-                self.debug_file.as_mut().unwrap(),
-                "{:08X}: {:08X} {:>8} {:08X} {:08X} {:08X}",
-                ip,
-                instruction,
-                OPCODES[usize::try_from(opcode).unwrap()],
-                self.registers[self.ra],
-                self.registers[self.rb],
-                self.registers[self.rc],
-            )
-            .unwrap();
+        if self.decomp {
+            match OPCODES.get(usize::try_from(opcode).unwrap()) {
+                Some(op) => write!(
+                    self.decomp_file.as_mut().unwrap(),
+                    "0x{:08X}: {:<05} {} {} {}\n",
+                    ip,
+                    op,
+                    self.ra,
+                    self.rb,
+                    self.rc,
+                )
+                .unwrap(),
+                None => write!(
+                    self.decomp_file.as_mut().unwrap(),
+                    "0x{:08X}: 0x{:08X}\n",
+                    ip,
+                    instruction
+                ).unwrap(),
+            };
+            return Ok(());
         }
 
         match opcode {
@@ -339,6 +322,11 @@ impl UM32 {
         self.heap[0] = Some(v);
     }
 
+    // #13. Orthography.
+    //
+    // The value indicated is loaded into the register A
+    // forthwith.
+    //
     // One special operator does not describe registers in the same way.
     // Instead the three bits immediately less significant than the four
     // instruction indicator bits describe a single register A. The
@@ -356,37 +344,30 @@ impl UM32 {
     //      |      value
     //      |
     //      operator number
-    //
-    //     Figure 3. Special Operators
-    //
-    // #13. Orthography.
-    //
-    // The value indicated is loaded into the register A
-    // forthwith.
     fn ortho(&mut self, instruction: Platter) {
-        self.ra = (instruction >> 25 & REG_MASK) as usize;
-        let value = instruction & ORTHO_MASK;
+        self.ra = (instruction >> 25 & 0b111u32) as usize;
+        let value = instruction & 0b1111111111111111111111111u32;
         self.registers[self.ra] = value;
     }
 }
 
-fn main() {
+fn main() -> Result<(), String> {
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
-        eprintln!("Provide a UM-32 program as an argument.");
-        process::exit(-1);
+        return Err("Provide a UM-32 program as an argument.".to_string());
     }
 
     let program = File::open(args[1].as_str()).unwrap();
-    let debug = env::var("DEBUG").is_ok();
+    let decomp = env::var("DECOMP").is_ok();
 
-    let mut debug_file: Option<File> = None;
-    if debug {
-        debug_file = Some(File::create(env::var("DEBUG_FILE").unwrap()).unwrap());
+    let mut decomp_file: Option<BufWriter<File>> = None;
+    if decomp {
+        decomp_file = Some(BufWriter::new(
+            File::create(env::var("DECOMP_FILE").unwrap()).unwrap(),
+        ));
     }
 
-    let mut um = UM32::new(debug, debug_file);
+    let mut um = UM32::new(decomp, decomp_file);
     um.parse(program);
-
-    um.run();
+    um.run()
 }
